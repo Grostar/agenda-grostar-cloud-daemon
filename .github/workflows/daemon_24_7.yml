@@ -1,0 +1,143 @@
+name: Agenda Grostar 24/7 Cloud Daemon
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-daemon:
+    name: Agenda Grostar 24/7 Runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TZ: Europe/Madrid
+      GH_PAT: ${{ secrets.GH_PAT }}
+      GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+      TIMEZONE: Europe/Madrid
+      MORNING_SUMMARY_HOUR: ${{ secrets.MORNING_SUMMARY_HOUR }}
+      PORT: ${{ secrets.PORT || '8080' }}
+      CLOUD_DAEMON_24_7: "true"
+      RENDER: "false"
+
+    steps:
+      - name: Checkout Daemon Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Fast Watchdog Gatekeeper Check
+        id: watchdog
+        run: |
+          python -u -c '
+          import os, sys, urllib.request, json
+          event = os.environ.get("GITHUB_EVENT_NAME", "")
+          pat = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")
+          repo = os.environ.get("GITHUB_REPOSITORY", "Grostar/agenda-grostar-cloud-daemon")
+          current_run_id = str(os.environ.get("GITHUB_RUN_ID", ""))
+          
+          if not pat:
+              print("No GH_PAT found, skipping gatekeeper.")
+              sys.exit(0)
+              
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/actions/workflows/daemon_24_7.yml/runs?status=in_progress",
+              headers={
+                  "Authorization": f"Bearer {pat}",
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "Watchdog-Gatekeeper"
+              }
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=8) as resp:
+                  data = json.loads(resp.read().decode())
+                  other_runs = [r for r in data.get("workflow_runs", []) if str(r.get("id")) != current_run_id]
+                  if event == "schedule" and other_runs:
+                      print(f"Watchdog: Ya existe un ciclo activo (ID={other_runs[0].get(\"id\")}). Saliendo en 1 segundo.")
+                      sys.exit(100)
+                  print(f"Gatekeeper OK: Evento={event}, Ciclos activos previos={len(other_runs)}")
+          except urllib.error.HTTPError as e:
+              print(f"Aviso HTTP en gatekeeper: {e}")
+          except Exception as e:
+              print(f"Aviso en gatekeeper: {e}")
+          ' || EXIT_CODE=$?
+          if [ "${EXIT_CODE}" = "100" ]; then
+            echo "SKIP_RUN=true" >> $GITHUB_OUTPUT
+            echo "Watchdog: Otro ciclo activo. Finalizando trabajo inmediatamente."
+          else
+            echo "SKIP_RUN=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Clone Agenda-Grostar Repository
+        if: steps.watchdog.outputs.SKIP_RUN != 'true'
+        run: |
+          git config --global user.name "Grostar"
+          git config --global user.email "Grostar888@gmail.com"
+          git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/Grostar/Agenda-Grostar.git agenda_app
+
+      - name: Install Dependencies
+        if: steps.watchdog.outputs.SKIP_RUN != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r agenda_app/requirements.txt
+          pip install requests psutil urllib3
+
+      - name: Run 24/7 Cloud Daemon Supervisor
+        if: steps.watchdog.outputs.SKIP_RUN != 'true'
+        run: |
+          python -u supervisor.py
+
+      - name: Failover Backup Relay Check
+        if: always() && steps.watchdog.outputs.SKIP_RUN != 'true'
+        run: |
+          python -u -c '
+          import os, sys, urllib.request, json
+          pat = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")
+          repo = os.environ.get("GITHUB_REPOSITORY", "Grostar/agenda-grostar-cloud-daemon")
+          current_run_id = str(os.environ.get("GITHUB_RUN_ID", ""))
+          
+          if not pat:
+              sys.exit(0)
+              
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/actions/workflows/daemon_24_7.yml/runs",
+              headers={
+                  "Authorization": f"Bearer {pat}",
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "Failover-Backup"
+              }
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  data = json.loads(resp.read().decode())
+                  active_or_queued = [
+                      r for r in data.get("workflow_runs", [])
+                      if str(r.get("id")) != current_run_id and r.get("status") in ("in_progress", "queued")
+                  ]
+                  if not active_or_queued:
+                      print("Failover: No hay ningún ciclo activo ni en cola. Relanzando relevo de emergencia...")
+                      dispatch_req = urllib.request.Request(
+                          f"https://api.github.com/repos/{repo}/actions/workflows/daemon_24_7.yml/dispatches",
+                          data=json.dumps({"ref": "main"}).encode(),
+                          headers={
+                              "Authorization": f"Bearer {pat}",
+                              "Accept": "application/vnd.github+json",
+                              "Content-Type": "application/json",
+                              "User-Agent": "Failover-Backup"
+                          },
+                          method="POST"
+                      )
+                      urllib.request.urlopen(dispatch_req, timeout=10)
+                      print("Failover: Disparado nuevo ciclo con éxito.")
+                  else:
+                      print(f"Failover: Ya existe ciclo activo/en cola ({active_or_queued[0].get(\"id\")}). No es necesario relanzar.")
+          except Exception as e:
+              print(f"Error en failover check: {e}")
+          '
