@@ -44,7 +44,7 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", "19200"))  # ~5h
 PRE_WARMED_LEAD_SECONDS = int(os.environ.get("PRE_WARMED_LEAD_SECONDS", "85"))
 PORT = os.environ.get("PORT", "8080")
 GH_PAT = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN", "")
-CURRENT_RUN_ID = os.environ.get("GITHUB_RUN_ID", "")
+CURRENT_RUN_ID = str(os.environ.get("GITHUB_RUN_ID", ""))
 
 
 def github_api(endpoint: str, method: str = "GET", data: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -98,9 +98,13 @@ def wait_for_older_daemon_runs_to_finish(max_wait_seconds: int = 90) -> None:
         runs = data.get("workflow_runs", [])
         older_runs = []
         for r in runs:
-            r_id = str(r.get("id"))
-            if r_id != str(CURRENT_RUN_ID):
-                older_runs.append(r)
+            r_id = str(r.get("id", ""))
+            if r_id != CURRENT_RUN_ID:
+                if CURRENT_RUN_ID.isdigit() and r_id.isdigit():
+                    if int(r_id) < int(CURRENT_RUN_ID):
+                        older_runs.append(r)
+                else:
+                    older_runs.append(r)
 
         if not older_runs:
             logger.info("No hay ciclos anteriores activos. Canal de Telegram libre.")
@@ -180,8 +184,10 @@ def main() -> int:
     logger.info("Run ID Actual: %s", CURRENT_RUN_ID or "local")
     logger.info("==================================================================")
 
+    # 1. Esperar a que el ciclo anterior termine si existe
     wait_for_older_daemon_runs_to_finish(max_wait_seconds=90)
 
+    # 2. Localizar directorio de la aplicación
     base_dir = os.path.dirname(os.path.abspath(__file__))
     app_dir = os.path.join(base_dir, "agenda_app")
     if not os.path.exists(os.path.join(app_dir, "main.py")):
@@ -193,6 +199,18 @@ def main() -> int:
 
     main_py = os.path.join(app_dir, "main.py")
     logger.info("Directorio de la aplicación: %s", app_dir)
+
+    # Asegurar que la rama local en el runner esté al día
+    try:
+        subprocess.run(
+            ["git", "pull", "--rebase"],
+            cwd=app_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except Exception:
+        pass
 
     bot_env = os.environ.copy()
     bot_env["CLOUD_DAEMON_24_7"] = "true"
