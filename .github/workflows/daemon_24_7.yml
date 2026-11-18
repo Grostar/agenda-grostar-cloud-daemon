@@ -28,56 +28,64 @@ jobs:
       - name: Checkout Daemon Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Fast Watchdog Gatekeeper Check
         id: watchdog
         run: |
-          python -u -c '
-          import os, sys, urllib.request, json
+          python -u - << 'EOF'
+          import json, os, urllib.error, urllib.request
+
           event = os.environ.get("GITHUB_EVENT_NAME", "")
           pat = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")
           repo = os.environ.get("GITHUB_REPOSITORY", "Grostar/agenda-grostar-cloud-daemon")
           current_run_id = str(os.environ.get("GITHUB_RUN_ID", ""))
-          
+          skip = "false"
+
           if not pat:
               print("No GH_PAT found, skipping gatekeeper.")
-              sys.exit(0)
-              
-          req = urllib.request.Request(
-              f"https://api.github.com/repos/{repo}/actions/workflows/daemon_24_7.yml/runs?status=in_progress",
-              headers={
-                  "Authorization": f"Bearer {pat}",
-                  "Accept": "application/vnd.github+json",
-                  "User-Agent": "Watchdog-Gatekeeper"
-              }
-          )
-          try:
-              with urllib.request.urlopen(req, timeout=8) as resp:
-                  data = json.loads(resp.read().decode())
-                  other_runs = [r for r in data.get("workflow_runs", []) if str(r.get("id")) != current_run_id]
-                  if event == "schedule" and other_runs:
-                      print(f"Watchdog: Ya existe un ciclo activo (ID={other_runs[0].get(\"id\")}). Saliendo en 1 segundo.")
-                      sys.exit(100)
-                  print(f"Gatekeeper OK: Evento={event}, Ciclos activos previos={len(other_runs)}")
-          except urllib.error.HTTPError as e:
-              print(f"Aviso HTTP en gatekeeper: {e}")
-          except Exception as e:
-              print(f"Aviso en gatekeeper: {e}")
-          ' || EXIT_CODE=$?
-          if [ "${EXIT_CODE}" = "100" ]; then
-            echo "SKIP_RUN=true" >> $GITHUB_OUTPUT
-            echo "Watchdog: Otro ciclo activo. Finalizando trabajo inmediatamente."
-          else
-            echo "SKIP_RUN=false" >> $GITHUB_OUTPUT
-          fi
+          else:
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/actions/workflows/daemon_24_7.yml/runs?per_page=10",
+                  headers={
+                      "Authorization": f"Bearer {pat}",
+                      "Accept": "application/vnd.github+json",
+                      "User-Agent": "Watchdog-Gatekeeper",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as resp:
+                      data = json.loads(resp.read().decode("utf-8"))
+                      other_runs = [
+                          r for r in data.get("workflow_runs", [])
+                          if str(r.get("id", "")) != current_run_id
+                          and r.get("status") in ("in_progress", "queued", "waiting", "pending")
+                      ]
+                      if event == "schedule" and other_runs:
+                          active_id = other_runs[0].get("id")
+                          active_st = other_runs[0].get("status")
+                          print(f"Watchdog: Ya existe un ciclo activo/en cola (ID={active_id}, status={active_st}). Saliendo en 1 segundo.")
+                          skip = "true"
+                      else:
+                          print(f"Gatekeeper OK: Evento={event}, Ciclos activos previos={len(other_runs)}")
+              except urllib.error.HTTPError as e:
+                  print(f"Aviso HTTP en gatekeeper: {e}")
+              except Exception as e:
+                  print(f"Aviso en gatekeeper: {e}")
+
+          gh_out = os.environ.get("GITHUB_OUTPUT")
+          if gh_out:
+              with open(gh_out, "a", encoding="utf-8") as f:
+                  f.write(f"SKIP_RUN={skip}\n")
+          EOF
 
       - name: Clone Agenda-Grostar Repository
         if: steps.watchdog.outputs.SKIP_RUN != 'true'
         run: |
+          git config --global --add safe.directory "*"
           git config --global user.name "Grostar"
           git config --global user.email "Grostar888@gmail.com"
           git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/Grostar/Agenda-Grostar.git agenda_app
@@ -85,9 +93,9 @@ jobs:
       - name: Install Dependencies
         if: steps.watchdog.outputs.SKIP_RUN != 'true'
         run: |
-          python -m pip install --upgrade pip
-          pip install -r agenda_app/requirements.txt
-          pip install requests psutil urllib3
+          python -m pip install --upgrade pip -q
+          pip install -r agenda_app/requirements.txt -q
+          pip install requests psutil urllib3 -q
 
       - name: Run 24/7 Cloud Daemon Supervisor
         if: steps.watchdog.outputs.SKIP_RUN != 'true'
@@ -97,47 +105,48 @@ jobs:
       - name: Failover Backup Relay Check
         if: always() && steps.watchdog.outputs.SKIP_RUN != 'true'
         run: |
-          python -u -c '
-          import os, sys, urllib.request, json
+          python -u - << 'EOF'
+          import json, os, urllib.request
+
           pat = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")
           repo = os.environ.get("GITHUB_REPOSITORY", "Grostar/agenda-grostar-cloud-daemon")
           current_run_id = str(os.environ.get("GITHUB_RUN_ID", ""))
-          
-          if not pat:
-              sys.exit(0)
-              
-          req = urllib.request.Request(
-              f"https://api.github.com/repos/{repo}/actions/workflows/daemon_24_7.yml/runs",
-              headers={
-                  "Authorization": f"Bearer {pat}",
-                  "Accept": "application/vnd.github+json",
-                  "User-Agent": "Failover-Backup"
-              }
-          )
-          try:
-              with urllib.request.urlopen(req, timeout=10) as resp:
-                  data = json.loads(resp.read().decode())
-                  active_or_queued = [
-                      r for r in data.get("workflow_runs", [])
-                      if str(r.get("id")) != current_run_id and r.get("status") in ("in_progress", "queued")
-                  ]
-                  if not active_or_queued:
-                      print("Failover: No hay ningún ciclo activo ni en cola. Relanzando relevo de emergencia...")
-                      dispatch_req = urllib.request.Request(
-                          f"https://api.github.com/repos/{repo}/actions/workflows/daemon_24_7.yml/dispatches",
-                          data=json.dumps({"ref": "main"}).encode(),
-                          headers={
-                              "Authorization": f"Bearer {pat}",
-                              "Accept": "application/vnd.github+json",
-                              "Content-Type": "application/json",
-                              "User-Agent": "Failover-Backup"
-                          },
-                          method="POST"
-                      )
-                      urllib.request.urlopen(dispatch_req, timeout=10)
-                      print("Failover: Disparado nuevo ciclo con éxito.")
-                  else:
-                      print(f"Failover: Ya existe ciclo activo/en cola ({active_or_queued[0].get(\"id\")}). No es necesario relanzar.")
-          except Exception as e:
-              print(f"Error en failover check: {e}")
-          '
+
+          if pat:
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/actions/workflows/daemon_24_7.yml/runs?per_page=10",
+                  headers={
+                      "Authorization": f"Bearer {pat}",
+                      "Accept": "application/vnd.github+json",
+                      "User-Agent": "Failover-Backup",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as resp:
+                      data = json.loads(resp.read().decode("utf-8"))
+                      active_or_queued = [
+                          r for r in data.get("workflow_runs", [])
+                          if str(r.get("id", "")) != current_run_id
+                          and r.get("status") in ("in_progress", "queued", "waiting", "pending")
+                      ]
+                      if not active_or_queued:
+                          print("Failover: No hay ningún ciclo activo ni en cola. Relanzando relevo de emergencia...")
+                          dispatch_req = urllib.request.Request(
+                              f"https://api.github.com/repos/{repo}/actions/workflows/daemon_24_7.yml/dispatches",
+                              data=json.dumps({"ref": "main"}).encode("utf-8"),
+                              headers={
+                                  "Authorization": f"Bearer {pat}",
+                                  "Accept": "application/vnd.github+json",
+                                  "Content-Type": "application/json",
+                                  "User-Agent": "Failover-Backup",
+                              },
+                              method="POST",
+                          )
+                          urllib.request.urlopen(dispatch_req, timeout=10)
+                          print("Failover: Disparado nuevo ciclo con éxito.")
+                      else:
+                          relay_id = active_or_queued[0].get("id")
+                          print(f"Failover: Ya existe ciclo activo/en cola ({relay_id}). No es necesario relanzar.")
+              except Exception as e:
+                  print(f"Error en failover check: {e}")
+          EOF

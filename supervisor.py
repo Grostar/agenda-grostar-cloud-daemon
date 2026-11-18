@@ -22,7 +22,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 logging.basicConfig(
@@ -131,7 +131,18 @@ def is_in_critical_window() -> bool:
 
 
 def trigger_next_cycle() -> bool:
-    """Lanza el siguiente ciclo 24/7 mediante workflow_dispatch."""
+    """Lanza el siguiente ciclo 24/7 mediante workflow_dispatch si no hay ya uno nuevo activo o en cola."""
+    data = github_api(f"/repos/{REPO_OWNER}/{DAEMON_REPO}/actions/workflows/{WORKFLOW_FILE}/runs?per_page=8")
+    if data:
+        for r in data.get("workflow_runs", []):
+            r_id = str(r.get("id", ""))
+            if r_id == CURRENT_RUN_ID:
+                continue
+            if r.get("status") in ("in_progress", "queued", "waiting", "pending"):
+                if not CURRENT_RUN_ID.isdigit() or not r_id.isdigit() or int(r_id) > int(CURRENT_RUN_ID):
+                    logger.info("Ya existe un ciclo de relevo preparado (ID=%s, status=%s). Omitiendo doble despacho.", r_id, r.get("status"))
+                    return True
+
     logger.info("🚀 Lanzando siguiente ciclo de relevo 24/7 en %s...", DAEMON_REPO)
     res = github_api(
         f"/repos/{REPO_OWNER}/{DAEMON_REPO}/actions/workflows/{WORKFLOW_FILE}/dispatches",
@@ -185,7 +196,7 @@ def main() -> int:
     logger.info("==================================================================")
 
     # 1. Esperar a que el ciclo anterior termine si existe
-    wait_for_older_daemon_runs_to_finish(max_wait_seconds=90)
+    wait_for_older_daemon_runs_to_finish(max_wait_seconds=120)
 
     # 2. Localizar directorio de la aplicación
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -200,15 +211,23 @@ def main() -> int:
     main_py = os.path.join(app_dir, "main.py")
     logger.info("Directorio de la aplicación: %s", app_dir)
 
-    # Asegurar que la rama local en el runner esté al día
+    # Asegurar que la rama local en el runner esté al día tras el cierre del ciclo anterior
     try:
-        subprocess.run(
-            ["git", "pull", "--rebase"],
+        r_pull = subprocess.run(
+            ["git", "pull", "--rebase", "--autostash", "origin", "main"],
             cwd=app_dir,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=15,
+            timeout=20,
         )
+        if r_pull.returncode != 0:
+            subprocess.run(
+                ["git", "rebase", "--abort"],
+                cwd=app_dir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
     except Exception:
         pass
 
@@ -276,6 +295,9 @@ def main() -> int:
                     int(time_remaining), PRE_WARMED_LEAD_SECONDS
                 )
                 dispatched_ok = trigger_next_cycle()
+                if not dispatched_ok and time_remaining > 20:
+                    logger.warning("Reintentando despacho del siguiente ciclo en la próxima iteración...")
+                    continue
                 next_cycle_dispatched = True
 
                 logger.info("Esperando 30 segundos a que el nuevo ciclo se prepare...")
