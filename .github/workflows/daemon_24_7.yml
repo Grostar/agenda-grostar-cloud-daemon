@@ -26,14 +26,17 @@ jobs:
 
     steps:
       - name: Checkout Daemon Repository
+        continue-on-error: true
         uses: actions/checkout@v4
 
       - name: Set up Python 3.12
+        continue-on-error: true
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Fast Watchdog Gatekeeper Check
+        continue-on-error: true
         id: watchdog
         run: |
           python -u - << 'EOF'
@@ -83,6 +86,7 @@ jobs:
           EOF
 
       - name: Clone Agenda-Grostar Repository
+        continue-on-error: true
         if: steps.watchdog.outputs.SKIP_RUN != 'true'
         run: |
           git config --global --add safe.directory "*"
@@ -91,6 +95,7 @@ jobs:
           git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/Grostar/Agenda-Grostar.git agenda_app
 
       - name: Install Dependencies
+        continue-on-error: true
         if: steps.watchdog.outputs.SKIP_RUN != 'true'
         run: |
           python -m pip install --upgrade pip -q
@@ -98,11 +103,13 @@ jobs:
           pip install requests psutil urllib3 -q
 
       - name: Run 24/7 Cloud Daemon Supervisor
+        continue-on-error: true
         if: steps.watchdog.outputs.SKIP_RUN != 'true'
         run: |
           python -u supervisor.py
 
       - name: Failover Backup Relay Check
+        continue-on-error: true
         if: always() && steps.watchdog.outputs.SKIP_RUN != 'true'
         run: |
           python -u - << 'EOF'

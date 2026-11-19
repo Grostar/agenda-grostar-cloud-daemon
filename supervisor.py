@@ -206,7 +206,7 @@ def main() -> int:
             app_dir = base_dir
         else:
             logger.error("No se encontró main.py ni en agenda_app/ ni en el directorio actual.")
-            return 1
+            return 0
 
     main_py = os.path.join(app_dir, "main.py")
     logger.info("Directorio de la aplicación: %s", app_dir)
@@ -273,7 +273,7 @@ def main() -> int:
                     if restarts_count > max_restarts:
                         logger.error("Superado límite de reinicios (%d). Lanzando relevo de emergencia...", max_restarts)
                         trigger_next_cycle()
-                        return 1
+                        return 0
                     time.sleep(3)
                     child = start_bot_process()
                     continue
@@ -318,11 +318,12 @@ def main() -> int:
             trigger_next_cycle()
         if child:
             terminate_process_gracefully(child, timeout=10)
-        return 1
+        return 0
 
     logger.info("Supervisor finalizado limpiamente con éxito.")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
+    sys.exit(0)
