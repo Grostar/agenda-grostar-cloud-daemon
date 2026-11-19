@@ -92,7 +92,8 @@ jobs:
           git config --global --add safe.directory "*"
           git config --global user.name "Grostar"
           git config --global user.email "Grostar888@gmail.com"
-          git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/Grostar/Agenda-Grostar.git agenda_app
+          for i in 1 2 3; do rm -rf agenda_app && git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/Grostar/Agenda-Grostar.git agenda_app && break || sleep 3; done
+          mkdir -p agenda_app
 
       - name: Install Dependencies
         continue-on-error: true
