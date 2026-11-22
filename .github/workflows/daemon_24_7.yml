@@ -101,7 +101,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip -q
           pip install -r agenda_app/requirements.txt -q
-          pip install requests psutil urllib3 -q
 
       - name: Run 24/7 Cloud Daemon Supervisor
         continue-on-error: true
