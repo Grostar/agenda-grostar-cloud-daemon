@@ -3,8 +3,8 @@ supervisor.py - Supervisor de Ejecución Continua 24/7 para Agenda Grostar
 Repositorio Daemon: Grostar/agenda-grostar-cloud-daemon
 Garantiza:
 1. Relevo pre-calentado con 0 segundos de corte y sin colisiones 409 Conflict en Telegram.
-2. Comprobación de ciclo anterior: espera a que el ciclo previo termine antes de iniciar polling.
-3. Respeto de la ventana crítica matutina (07:55 - 08:05 Europe/Madrid): nunca releva durante el resumen matutino.
+2. Comprobación de ciclo anterior: espera con reintentos a que el ciclo previo termine y libere Telegram antes de iniciar polling.
+3. Respeto de la ventana crítica matutina (MORNING_SUMMARY_HOUR ± 5 min Europe/Madrid): nunca releva durante el resumen matutino.
 4. Heartbeat y comprobación puntual de alertas cada 60s vía endpoint local /cron-check.
 5. Monitoreo continuo del proceso bot (agenda_app/main.py) y auto-recuperación si cae.
 6. Disparo puntual del siguiente ciclo antes de que expire el runner de GitHub Actions (MAX_RUNTIME_SECONDS=19200).
@@ -78,10 +78,10 @@ def github_api(endpoint: str, method: str = "GET", data: Optional[Dict[str, Any]
         return None
 
 
-def wait_for_older_daemon_runs_to_finish(max_wait_seconds: int = 90) -> None:
+def wait_for_older_daemon_runs_to_finish(max_wait_seconds: int = 120) -> None:
     """
     Si este ciclo fue lanzado como relevo mientras un ciclo previo estaba activo,
-    espera a que el ciclo previo termine su proceso y cierre la conexión de Telegram
+    espera con reintentos a que el ciclo previo termine y libere el socket de Telegram
     para evitar conflictos 409 Conflict.
     """
     if not CURRENT_RUN_ID:
@@ -89,15 +89,20 @@ def wait_for_older_daemon_runs_to_finish(max_wait_seconds: int = 90) -> None:
 
     logger.info("Comprobando si hay ciclos anteriores activos en %s...", DAEMON_REPO)
     start_wait = time.time()
+    waited_for_predecessor = False
 
     while time.time() - start_wait < max_wait_seconds:
-        data = github_api(f"/repos/{REPO_OWNER}/{DAEMON_REPO}/actions/workflows/{WORKFLOW_FILE}/runs?status=in_progress")
+        data = github_api(f"/repos/{REPO_OWNER}/{DAEMON_REPO}/actions/workflows/{WORKFLOW_FILE}/runs?per_page=10")
         if not data:
-            break
+            logger.debug("Fallo temporal consultando API GitHub; reintentando espera...")
+            time.sleep(3)
+            continue
 
         runs = data.get("workflow_runs", [])
         older_runs = []
         for r in runs:
+            if r.get("status") not in ("in_progress", "queued", "waiting", "pending"):
+                continue
             r_id = str(r.get("id", ""))
             if r_id != CURRENT_RUN_ID:
                 if CURRENT_RUN_ID.isdigit() and r_id.isdigit():
@@ -107,9 +112,12 @@ def wait_for_older_daemon_runs_to_finish(max_wait_seconds: int = 90) -> None:
                     older_runs.append(r)
 
         if not older_runs:
+            if waited_for_predecessor:
+                time.sleep(2)
             logger.info("No hay ciclos anteriores activos. Canal de Telegram libre.")
             return
 
+        waited_for_predecessor = True
         older_id = older_runs[0].get("id")
         elapsed = int(time.time() - start_wait)
         logger.info(
@@ -123,11 +131,23 @@ def wait_for_older_daemon_runs_to_finish(max_wait_seconds: int = 90) -> None:
 
 def is_in_critical_window() -> bool:
     """
-    Devuelve True si nos encontramos en la ventana de envío del Resumen Matutino (07:55 - 08:05 Europe/Madrid).
-    Durante esta ventana no se debe iniciar un relevo para no cortar el envío matutino.
+    Devuelve True si nos encontramos en la ventana crítica del Resumen Matutino
+    (MORNING_SUMMARY_HOUR ± 5 minutos en zona horaria configurada).
     """
     now = datetime.now(TZ)
-    return (now.hour == 7 and now.minute >= 55) or (now.hour == 8 and now.minute <= 5)
+    morning_hhmm = os.environ.get("MORNING_SUMMARY_HOUR", "08:00").strip() or "08:00"
+    try:
+        h_str, m_str = morning_hhmm.split(":", 1)
+        target_h, target_m = int(h_str), int(m_str)
+        if not (0 <= target_h <= 23 and 0 <= target_m <= 59):
+            target_h, target_m = 8, 0
+    except Exception:
+        target_h, target_m = 8, 0
+
+    curr_mins = now.hour * 60 + now.minute
+    target_mins = target_h * 60 + target_m
+    diff = abs(curr_mins - target_mins)
+    return diff <= 5 or diff >= (1440 - 5)
 
 
 def trigger_next_cycle() -> bool:
@@ -168,7 +188,7 @@ def ping_cron_check_endpoint() -> None:
         logger.debug("Aviso al consultar /cron-check local: %s", e)
 
 
-def terminate_process_gracefully(proc: subprocess.Popen, timeout: int = 20) -> None:
+def terminate_process_gracefully(proc: subprocess.Popen, timeout: int = 25) -> None:
     """Detiene el proceso hijo enviando SIGTERM (o terminate en Windows) y esperando su salida."""
     if proc.poll() is not None:
         return
@@ -286,7 +306,7 @@ def main() -> int:
             if time_remaining <= PRE_WARMED_LEAD_SECONDS and not next_cycle_dispatched:
                 if is_in_critical_window():
                     logger.info(
-                        "Alcanzado tiempo de relevo pero en ventana crítica (07:55 - 08:05 Europe/Madrid). Pospobiendo..."
+                        "Alcanzado tiempo de relevo pero en ventana crítica del resumen matutino. Pospobiendo..."
                     )
                     continue
 
@@ -300,11 +320,11 @@ def main() -> int:
                     continue
                 next_cycle_dispatched = True
 
-                logger.info("Esperando 30 segundos a que el nuevo ciclo se prepare...")
-                time.sleep(30)
+                logger.info("Esperando 20 segundos a que el nuevo ciclo se prepare...")
+                time.sleep(20)
 
                 logger.info("Deteniendo bot local para transferir la sesión de Telegram al nuevo ciclo...")
-                terminate_process_gracefully(child, timeout=20)
+                terminate_process_gracefully(child, timeout=25)
                 logger.info("Relevo 24/7 completado sin interrupción.")
                 break
 
